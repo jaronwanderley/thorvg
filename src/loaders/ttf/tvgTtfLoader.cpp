@@ -31,6 +31,9 @@
     #include <sys/stat.h>
 #endif
 
+#include <cstdio>
+#include <cstdlib>
+
 /************************************************************************/
 /* Internal Class Implementation                                        */
 /************************************************************************/
@@ -39,92 +42,11 @@
 #define LINE_FEED_GLYPH_IDX 10
 #define DOT_GLYPH_IDX 46
 
-
-#ifdef THORVG_FILE_IO_SUPPORT
-
-#if defined(_WIN32) && (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP)
-
-static bool _map(TtfLoader* loader, const string& path)
-{
-    auto& reader = loader->reader;
-
-	auto file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-	if (file == INVALID_HANDLE_VALUE) return false;
-
-	DWORD high;
-	auto low = GetFileSize(file, &high);
-	if (low == INVALID_FILE_SIZE) {
-		CloseHandle(file);
-		return false;
-	}
-
-	reader.size = (uint32_t)((size_t)high << (8 * sizeof(DWORD)) | low);
-
-	loader->mapping = (uint8_t*)CreateFileMapping(file, NULL, PAGE_READONLY, high, low, NULL);
-
-	CloseHandle(file);
-
-	if (!loader->mapping) return false;
-
-	loader->reader.data = (uint8_t*) MapViewOfFile(loader->mapping, FILE_MAP_READ, 0, 0, 0);
-	if (!loader->reader.data) {
-		CloseHandle(loader->mapping);
-		loader->mapping = nullptr;
-		return false;
-	}
-	return true;
-}
-
-static void _unmap(TtfLoader* loader)
-{
-    auto& reader = loader->reader;
-
-	if (reader.data) {
-		UnmapViewOfFile(reader.data);
-		reader.data = nullptr;
-	}
-	if (loader->mapping) {
-		CloseHandle(loader->mapping);
-		loader->mapping = nullptr;
-	}
-}
-
-#elif defined(__linux__)
-
 static bool _map(TtfLoader* loader, const char* path)
 {
     auto& reader = loader->reader;
 
-    auto fd = open(path, O_RDONLY);
-    if (fd < 0) return false;
-
-    struct stat info;
-    if (fstat(fd, &info) < 0) {
-        close(fd);
-        return false;
-    }
-
-    reader.data = (uint8_t*)mmap(NULL, (size_t) info.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (reader.data == (uint8_t*)-1) return false;
-    reader.size = (uint32_t) info.st_size;
-    close(fd);
-
-    return true;
-}
-
-
-static void _unmap(TtfLoader* loader)
-{
-    auto& reader = loader->reader;
-    if (reader.data == (uint8_t*) -1) return;
-    munmap((void *) reader.data, reader.size);
-    reader.data = (uint8_t*)-1;
-    reader.size = 0;
-}
-#else
-static bool _map(TtfLoader* loader, const char* path)
-{
-    auto& reader = loader->reader;
+    if (!path) return false;
 
     auto f = fopen(path, "rb");
     if (!f) return false;
@@ -137,11 +59,17 @@ static bool _map(TtfLoader* loader, const char* path)
         return false;
     }
 
-    reader.data = tvg::malloc<uint8_t>(reader.size);
+    reader.data = (uint8_t*) malloc(reader.size);
+    if (!reader.data) {
+        fclose(f);
+        return false;
+    }
 
     fseek(f, 0, SEEK_SET);
     auto ret = fread(reader.data, sizeof(char), reader.size, f);
     if (ret < reader.size) {
+        free(reader.data);
+        reader.data = nullptr;
         fclose(f);
         return false;
     }
@@ -155,14 +83,10 @@ static bool _map(TtfLoader* loader, const char* path)
 static void _unmap(TtfLoader* loader)
 {
     auto& reader = loader->reader;
-    tvg::free(reader.data);
+    free(reader.data);
     reader.data = nullptr;
     reader.size = 0;
 }
-#endif
-
-#endif //THORVG_FILE_IO_SUPPORT
-
 
 static size_t _codepoints(char** utf8)
 {
@@ -243,18 +167,17 @@ uint32_t TtfLoader::feedLine(FontMetrics& fm, float box, float x, uint32_t begin
 void TtfLoader::clear()
 {
     if (nomap) {
-        if (freeData) tvg::free(reader.data);
+        if (freeData) free(reader.data);
         reader.data = nullptr;
         reader.size = 0;
         freeData = false;
         nomap = false;
     } else {
-#ifdef THORVG_FILE_IO_SUPPORT
         _unmap(this);
-#endif
     }
 
-    tvg::free(name);
+    //Use free/malloc consistently
+    if (name) free(name);
     name = nullptr;
 }
 
@@ -520,18 +443,15 @@ TtfLoader::~TtfLoader()
 
 bool TtfLoader::open(const char* path)
 {
-#ifdef THORVG_FILE_IO_SUPPORT
     clear();
     if (!_map(this, path)) return false;
 
-    name = tvg::filename(path);
+    name = tvg::duplicate(path);
 
-    return reader.header();
-#else
-    return false;
-#endif
+    if (!reader.header()) return false;
+
+    return true;
 }
-
 
 bool TtfLoader::open(const char* data, uint32_t size, TVG_UNUSED const char* rpath, bool copy)
 {
@@ -539,7 +459,7 @@ bool TtfLoader::open(const char* data, uint32_t size, TVG_UNUSED const char* rpa
     nomap = true;
 
     if (copy) {
-        reader.data = tvg::malloc<uint8_t>(size);
+        reader.data = (uint8_t*) malloc(size);
         if (!reader.data) return false;
         memcpy((char*)reader.data, data, reader.size);
         freeData = true;
@@ -576,7 +496,7 @@ bool TtfLoader::get(FontMetrics& fm, char* text, RenderPath& out)
 
 void TtfLoader::release(FontMetrics& fm)
 {
-    tvg::free(fm.engine);
+    free(fm.engine);
     fm.engine = nullptr;
 }
 
